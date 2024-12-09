@@ -8,17 +8,17 @@ interface ILido {
 }
 
 interface IWithdrawalQueue {
-    function requestWithdrawals(uint256[] calldata _amounts, address _owner) external returns (uint256[] memory requestIds);
-    function claimWithdrawalsTo(uint256[] calldata _requestIds, uint256[] calldata _hints, address _recipient) external;
-    function isReady(uint256 tokenId) external view returns (bool);
-
     struct WithdrawalRequestStatus {
-        bool ready;
-        uint256 amount;
-        uint256 createdAt;
-        uint256 executedAt;
+        uint256 amountOfStETH;
+        uint256 amountOfShares;
+        address owner;
+        uint256 timestamp;
+        bool isFinalized;
+        bool isClaimed;
     }
 
+    function requestWithdrawals(uint256[] calldata _amounts, address _owner) external returns (uint256[] memory requestIds);
+    function claimWithdrawalsTo(uint256[] calldata _requestIds, uint256[] calldata _hints, address _recipient) external;
     function getWithdrawalStatus(uint256[] calldata _requestIds) external view returns (WithdrawalRequestStatus[] memory statuses);
 }
 
@@ -86,7 +86,6 @@ contract EthToStethStaking {
 
         withdrawalQueue.claimWithdrawalsTo(requestIds, hints, recipient);
 
-        // Remove claimed requests
         for (uint256 i = 0; i < requestIds.length; i++) {
             removeTokenId(msg.sender, requestIds[i]);
         }
@@ -94,9 +93,38 @@ contract EthToStethStaking {
         emit WithdrawalClaimed(msg.sender, requestIds, recipient);
     }
 
-    function getWithdrawalStatus(uint256[] calldata requestIds) external view returns (IWithdrawalQueue.WithdrawalRequestStatus[] memory statuses) {
+    function getWithdrawalStatus(uint256[] calldata requestIds)
+        external
+        view
+        returns (
+            uint256[] memory amountOfStETH,
+            uint256[] memory amountOfShares,
+            address[] memory owners,
+            uint256[] memory timestamps,
+            bool[] memory isFinalized,
+            bool[] memory isClaimed
+        )
+    {
         require(requestIds.length > 0, "No request IDs provided");
-        return withdrawalQueue.getWithdrawalStatus(requestIds);
+        IWithdrawalQueue.WithdrawalRequestStatus[] memory statuses = withdrawalQueue.getWithdrawalStatus(requestIds);
+
+        amountOfStETH = new uint256[](statuses.length);
+        amountOfShares = new uint256[](statuses.length);
+        owners = new address[](statuses.length);
+        timestamps = new uint256[](statuses.length);
+        isFinalized = new bool[](statuses.length);
+        isClaimed = new bool[](statuses.length);
+
+        for (uint256 i = 0; i < statuses.length; i++) {
+            amountOfStETH[i] = statuses[i].amountOfStETH;
+            amountOfShares[i] = statuses[i].amountOfShares;
+            owners[i] = statuses[i].owner;
+            timestamps[i] = statuses[i].timestamp;
+            isFinalized[i] = statuses[i].isFinalized;
+            isClaimed[i] = statuses[i].isClaimed;
+        }
+
+        return (amountOfStETH, amountOfShares, owners, timestamps, isFinalized, isClaimed);
     }
 
     function isUserRequest(address user, uint256 tokenId) internal view returns (bool) {
