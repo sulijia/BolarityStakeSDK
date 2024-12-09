@@ -27,11 +27,12 @@ interface ILido {
 
 interface IWithdrawalQueue {
     /**
-     * @notice Submit a request to the withdrawal queue
-     * @param amount The amount of stETH to withdraw
-     * @return The NFT ID representing the withdrawal request
-     */
-    function submit(uint256 amount) external returns (uint256);
+    * @notice Submit multiple requests to the withdrawal queue
+    * @param _amounts An array of stETH amounts to withdraw
+    * @param _owner The owner of the withdrawal requests
+    * @return requestIds An array of request IDs
+    */
+    function requestWithdrawals(uint256[] calldata _amounts, address _owner) external returns (uint256[] memory requestIds);
 
     /**
      * @notice Claim the ETH from a completed withdrawal request
@@ -51,10 +52,10 @@ contract EthToStethStaking {
     ILido public lido; // Lido contract instance
     IWithdrawalQueue public withdrawalQueue; // Lido Withdrawal Queue instance
     mapping(address => uint256) public userStEthBalance; // Mapping to track user's stETH balance
-    mapping(address => uint256) public userWithdrawalNFT; // Mapping to track user's withdrawal NFT
+    mapping(address => uint256[]) public userWithdrawalNFTs; // Mapping to track user's withdrawal NFTs
 
     event Staked(address indexed user, uint256 ethAmount, uint256 stEthReceived);
-    event WithdrawalRequested(address indexed user, uint256 stEthAmount, uint256 tokenId);
+    event WithdrawalRequested(address indexed user, uint256 totalStEthAmount, uint256[] requestIds);
     event WithdrawalClaimed(address indexed user, uint256 tokenId);
     event DebugApproval(address spender, uint256 amount, bool success); // Debug approval event
     event DebugBalance(address account, uint256 balance); // Debug balance event
@@ -84,51 +85,86 @@ contract EthToStethStaking {
     }
 
     /**
-     * @notice Request a withdrawal of stETH, creating an NFT to represent the request
-     * @param stEthAmount The amount of stETH to withdraw
+     * @notice Request multiple withdrawals of stETH, creating NFTs to represent the requests
+     * @param stEthAmounts An array of stETH amounts to withdraw
      */
-    function requestWithdrawal(uint256 stEthAmount) external {
-        require(stEthAmount > 0, "Withdrawal amount must be greater than zero");
-        require(userStEthBalance[msg.sender] >= stEthAmount, "Insufficient stETH balance");
-        require(userWithdrawalNFT[msg.sender] == 0, "Existing withdrawal request in progress");
+    function requestWithdrawal(uint256[] calldata stEthAmounts) external {
+        require(stEthAmounts.length > 0, "Withdrawal amounts required");
 
-        // Deduct stETH from user's balance
-        userStEthBalance[msg.sender] -= stEthAmount;
+        uint256 totalAmount = 0;
+        for (uint256 i = 0; i < stEthAmounts.length; i++) {
+            require(stEthAmounts[i] > 0, "Invalid withdrawal amount");
+            totalAmount += stEthAmounts[i];
+        }
+
+        require(userStEthBalance[msg.sender] >= totalAmount, "Insufficient stETH balance");
+
+        // Deduct total stETH from user's balance
+        userStEthBalance[msg.sender] -= totalAmount;
 
         // Debug: Check contract's stETH balance
         uint256 contractBalance = lido.balanceOf(address(this));
         emit DebugBalance(address(this), contractBalance);
-        require(contractBalance >= stEthAmount, "Contract does not have enough stETH");
+        require(contractBalance >= totalAmount, "Contract does not have enough stETH");
 
         // Approve the withdrawal queue to transfer stETH
-        bool success = lido.approve(address(withdrawalQueue), stEthAmount);
-        emit DebugApproval(address(withdrawalQueue), stEthAmount, success);
+        bool success = lido.approve(address(withdrawalQueue), totalAmount);
+        emit DebugApproval(address(withdrawalQueue), totalAmount, success);
         require(success, "Approval failed");
 
-        // Submit the withdrawal request
-        uint256 tokenId = withdrawalQueue.submit(stEthAmount);
+        // Submit withdrawal requests
+        uint256[] memory requestIds = withdrawalQueue.requestWithdrawals(stEthAmounts, msg.sender);
 
-        // Track the user's withdrawal NFT
-        userWithdrawalNFT[msg.sender] = tokenId;
+        // Track the user's withdrawal NFTs
+        for (uint256 i = 0; i < requestIds.length; i++) {
+            userWithdrawalNFTs[msg.sender].push(requestIds[i]);
+        }
 
-        emit WithdrawalRequested(msg.sender, stEthAmount, tokenId);
+        emit WithdrawalRequested(msg.sender, totalAmount, requestIds);
     }
 
     /**
      * @notice Claim the ETH from a completed withdrawal request
+     * @param tokenId The NFT ID representing the withdrawal request
      */
-    function claimWithdrawal() external {
-        uint256 tokenId = userWithdrawalNFT[msg.sender];
-        require(tokenId != 0, "No withdrawal request found");
+    function claimWithdrawal(uint256 tokenId) external {
+        require(isUserRequest(msg.sender, tokenId), "Invalid or unowned request ID");
         require(withdrawalQueue.isReady(tokenId), "Withdrawal not ready");
 
         // Claim the ETH from the withdrawal queue
         withdrawalQueue.claim(tokenId);
 
-        // Clear the user's withdrawal NFT
-        userWithdrawalNFT[msg.sender] = 0;
+        // Remove the tokenId from user's NFT list
+        removeTokenId(msg.sender, tokenId);
 
         emit WithdrawalClaimed(msg.sender, tokenId);
+    }
+
+    /**
+     * @notice Helper function to check if a tokenId belongs to a user
+     */
+    function isUserRequest(address user, uint256 tokenId) internal view returns (bool) {
+        uint256[] memory requests = userWithdrawalNFTs[user];
+        for (uint256 i = 0; i < requests.length; i++) {
+            if (requests[i] == tokenId) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @notice Helper function to remove a tokenId from a user's NFT list
+     */
+    function removeTokenId(address user, uint256 tokenId) internal {
+        uint256[] storage requests = userWithdrawalNFTs[user];
+        for (uint256 i = 0; i < requests.length; i++) {
+            if (requests[i] == tokenId) {
+                requests[i] = requests[requests.length - 1];
+                requests.pop();
+                break;
+            }
+        }
     }
 
     /**
