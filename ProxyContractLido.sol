@@ -49,7 +49,7 @@ contract EthToStethStaking {
 
     function stake(uint256 lockTime) external payable {
         require(msg.value > 0, "ETH amount must be greater than zero");
-        require(lockTime >= 1 days, "Lock time must be at least 1 day");
+        require(lockTime >= 1 minutes, "Lock time must be at least 1 minute");
 
         uint256 stEthReceived = lido.submit{value: msg.value}(address(0));
         uint256 lockUntil = block.timestamp + lockTime;
@@ -153,16 +153,26 @@ contract EthToStethStaking {
         }
     }
 
-    function getStEthBalance(address user) external view returns (uint256) {
-        uint256 totalBalance = 0;
+    function getStEthBalance(address user) external view returns (uint256 withdrawableBalance, uint256 lockedBalance) {
+        uint256 totalWithdrawable = 0;
+        uint256 totalLocked = 0;
         Stake[] memory stakes = userStakes[user];
+
         for (uint256 i = 0; i < stakes.length; i++) {
             if (!stakes[i].isProcessed) {
-                totalBalance += stakes[i].remainingAmount;
+                if (block.timestamp >= stakes[i].lockUntil) {
+                    // if time expire, add it into totalWithdrawable
+                    totalWithdrawable += stakes[i].remainingAmount;
+                } else {
+                    // if still in lock，add it into totalLocked
+                    totalLocked += stakes[i].remainingAmount;
+                }
             }
         }
-        return totalBalance;
+
+        return (totalWithdrawable, totalLocked);
     }
+
 
     receive() external payable {}
 
