@@ -23,16 +23,22 @@ interface IWithdrawalQueue {
 }
 
 contract EthToStethStaking {
-    ILido public lido; // Lido contract instance
-    IWithdrawalQueue public withdrawalQueue; // Lido Withdrawal Queue instance
-    mapping(address => uint256) public userStEthBalance; // Mapping to track user's stETH balance
+    ILido public lido;
+    IWithdrawalQueue public withdrawalQueue;
+
+    struct Stake {
+        uint256 originalAmount;   // Original stETH amount staked
+        uint256 remainingAmount;  // Remaining stETH amount for withdrawal
+        uint256 lockUntil;        // Lock expiration timestamp
+        bool isProcessed;         // Whether this stake has been fully processed
+    }
+
+    mapping(address => Stake[]) public userStakes; // Mapping of user to their stakes
     mapping(address => uint256[]) public userWithdrawalNFTs; // Mapping to track user's withdrawal NFTs
 
-    event Staked(address indexed user, uint256 ethAmount, uint256 stEthReceived);
+    event Staked(address indexed user, uint256 ethAmount, uint256 stEthReceived, uint256 lockUntil);
     event WithdrawalRequested(address indexed user, uint256 totalStEthAmount, uint256[] requestIds);
     event WithdrawalClaimed(address indexed user, uint256[] requestIds, address recipient);
-    event DebugApproval(address spender, uint256 amount, bool success); // Debug approval event
-    event DebugBalance(address account, uint256 balance); // Debug balance event
 
     constructor(address _lido, address _withdrawalQueue) {
         require(_lido != address(0), "Invalid Lido contract address");
@@ -41,38 +47,71 @@ contract EthToStethStaking {
         withdrawalQueue = IWithdrawalQueue(_withdrawalQueue);
     }
 
-    function stake() external payable {
+    function stake(uint256 lockTime) external payable {
         require(msg.value > 0, "ETH amount must be greater than zero");
+        require(lockTime >= 1 days, "Lock time must be at least 1 day");
+
         uint256 stEthReceived = lido.submit{value: msg.value}(address(0));
-        userStEthBalance[msg.sender] += stEthReceived;
-        emit Staked(msg.sender, msg.value, stEthReceived);
+        uint256 lockUntil = block.timestamp + lockTime;
+
+        userStakes[msg.sender].push(Stake({
+            originalAmount: stEthReceived,
+            remainingAmount: stEthReceived,
+            lockUntil: lockUntil,
+            isProcessed: false
+        }));
+
+        emit Staked(msg.sender, msg.value, stEthReceived, lockUntil);
     }
 
-    function requestWithdrawal(uint256[] calldata stEthAmounts) external {
-        require(stEthAmounts.length > 0, "Withdrawal amounts required");
-        uint256 totalAmount = 0;
-        for (uint256 i = 0; i < stEthAmounts.length; i++) {
-            require(stEthAmounts[i] > 0, "Invalid withdrawal amount");
-            totalAmount += stEthAmounts[i];
+    function requestWithdrawal(uint256 totalStEthAmount) external {
+        require(totalStEthAmount > 0, "Withdrawal amount must be greater than zero");
+
+        Stake[] storage stakes = userStakes[msg.sender];
+        uint256 unlockedAmount = 0;
+        uint256 remainingAmount = totalStEthAmount;
+
+        require(stakes.length > 0, "No stakes available");
+
+        uint256[] memory amountsToWithdraw = new uint256[](stakes.length);
+        uint256 amountsCount = 0;
+
+        // Collect unlocked stakes and handle remaining balance
+        for (uint256 i = 0; i < stakes.length && remainingAmount > 0; i++) {
+            if (!stakes[i].isProcessed && stakes[i].lockUntil <= block.timestamp && stakes[i].remainingAmount > 0) {
+                uint256 amountToUse = stakes[i].remainingAmount > remainingAmount ? remainingAmount : stakes[i].remainingAmount;
+                unlockedAmount += amountToUse;
+                remainingAmount -= amountToUse;
+
+                // Deduct used amount from the remaining amount
+                stakes[i].remainingAmount -= amountToUse;
+
+                // If remainingAmount reaches 0, mark this stake as processed
+                if (stakes[i].remainingAmount == 0) {
+                    stakes[i].isProcessed = true;
+                }
+
+                amountsToWithdraw[amountsCount++] = amountToUse;
+            }
         }
 
-        require(userStEthBalance[msg.sender] >= totalAmount, "Insufficient stETH balance");
-        userStEthBalance[msg.sender] -= totalAmount;
+        require(unlockedAmount >= totalStEthAmount, "Insufficient unlocked stETH balance");
 
-        uint256 contractBalance = lido.balanceOf(address(this));
-        emit DebugBalance(address(this), contractBalance);
-        require(contractBalance >= totalAmount, "Contract does not have enough stETH");
+        // Trim the amountsToWithdraw array to the actual number of amounts
+        uint256[] memory finalAmounts = new uint256[](amountsCount);
+        for (uint256 i = 0; i < amountsCount; i++) {
+            finalAmounts[i] = amountsToWithdraw[i];
+        }
 
-        bool success = lido.approve(address(withdrawalQueue), totalAmount);
-        emit DebugApproval(address(withdrawalQueue), totalAmount, success);
+        bool success = lido.approve(address(withdrawalQueue), totalStEthAmount);
         require(success, "Approval failed");
 
-        uint256[] memory requestIds = withdrawalQueue.requestWithdrawals(stEthAmounts, msg.sender);
+        uint256[] memory requestIds = withdrawalQueue.requestWithdrawals(finalAmounts, msg.sender);
         for (uint256 i = 0; i < requestIds.length; i++) {
             userWithdrawalNFTs[msg.sender].push(requestIds[i]);
         }
 
-        emit WithdrawalRequested(msg.sender, totalAmount, requestIds);
+        emit WithdrawalRequested(msg.sender, totalStEthAmount, requestIds);
     }
 
     function claimWithdrawalsTo(uint256[] calldata requestIds, uint256[] calldata hints, address recipient) external {
@@ -91,40 +130,6 @@ contract EthToStethStaking {
         }
 
         emit WithdrawalClaimed(msg.sender, requestIds, recipient);
-    }
-
-    function getWithdrawalStatus(uint256[] calldata requestIds)
-        external
-        view
-        returns (
-            uint256[] memory amountOfStETH,
-            uint256[] memory amountOfShares,
-            address[] memory owners,
-            uint256[] memory timestamps,
-            bool[] memory isFinalized,
-            bool[] memory isClaimed
-        )
-    {
-        require(requestIds.length > 0, "No request IDs provided");
-        IWithdrawalQueue.WithdrawalRequestStatus[] memory statuses = withdrawalQueue.getWithdrawalStatus(requestIds);
-
-        amountOfStETH = new uint256[](statuses.length);
-        amountOfShares = new uint256[](statuses.length);
-        owners = new address[](statuses.length);
-        timestamps = new uint256[](statuses.length);
-        isFinalized = new bool[](statuses.length);
-        isClaimed = new bool[](statuses.length);
-
-        for (uint256 i = 0; i < statuses.length; i++) {
-            amountOfStETH[i] = statuses[i].amountOfStETH;
-            amountOfShares[i] = statuses[i].amountOfShares;
-            owners[i] = statuses[i].owner;
-            timestamps[i] = statuses[i].timestamp;
-            isFinalized[i] = statuses[i].isFinalized;
-            isClaimed[i] = statuses[i].isClaimed;
-        }
-
-        return (amountOfStETH, amountOfShares, owners, timestamps, isFinalized, isClaimed);
     }
 
     function isUserRequest(address user, uint256 tokenId) internal view returns (bool) {
@@ -149,7 +154,14 @@ contract EthToStethStaking {
     }
 
     function getStEthBalance(address user) external view returns (uint256) {
-        return userStEthBalance[user];
+        uint256 totalBalance = 0;
+        Stake[] memory stakes = userStakes[user];
+        for (uint256 i = 0; i < stakes.length; i++) {
+            if (!stakes[i].isProcessed) {
+                totalBalance += stakes[i].remainingAmount;
+            }
+        }
+        return totalBalance;
     }
 
     receive() external payable {}
