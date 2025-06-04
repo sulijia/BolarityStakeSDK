@@ -73,6 +73,8 @@ contract DustCollectorWithOptionalBridge is ReentrancyGuard, Ownable {
         uint256 totalETH;
         uint256 totalProcessed;
         int256 lastETHIndex;
+        address targetToken;      // 目标代币地址
+        uint256 totalTargetAmount; // 累积的目标代币总量
     }
 
     /// @notice Single dust swap, with optional bridge or direct send to user
@@ -149,6 +151,18 @@ contract DustCollectorWithOptionalBridge is ReentrancyGuard, Ownable {
             "Array length mismatch"
         );
 
+        // Validate all swap paths have the same target token for bridging efficiency
+        address targetToken = address(0);
+        if (len > 0) {
+            targetToken = swapPaths[0][swapPaths[0].length - 1];
+            for (uint256 i = 1; i < len; i++) {
+                require(
+                    swapPaths[i][swapPaths[i].length - 1] == targetToken,
+                    "All swaps must target the same token for efficient bridging"
+                );
+            }
+        }
+
         BridgeParams memory bridgeParams = _initializeBridgeParams(
             destinationChain,
             recipient,
@@ -158,7 +172,9 @@ contract DustCollectorWithOptionalBridge is ReentrancyGuard, Ownable {
         ProcessingState memory state = ProcessingState({
             totalETH: 0,
             totalProcessed: 0,
-            lastETHIndex: -1
+            lastETHIndex: -1,
+            targetToken: targetToken,
+            totalTargetAmount: 0
         });
 
         // Process all non-zero ETH dust and all ERC20 dust
@@ -181,6 +197,39 @@ contract DustCollectorWithOptionalBridge is ReentrancyGuard, Ownable {
 
         // Final validation
         _validateFinalETHBalance(bridgeParams, state);
+
+        // After all swaps completed, do single bridge or transfer
+        if (state.totalTargetAmount > 0) {
+            if (bridgeParams.doBridge) {
+                // Single bridge for all accumulated target tokens
+                uint64 seq = _bridgeAllTokens(state.targetToken, state.totalTargetAmount, bridgeParams);
+                emit DustProcessed(
+                    msg.sender,
+                    address(0), // Multiple dust tokens
+                    0,          // Multiple amounts
+                    state.targetToken,
+                    state.totalTargetAmount,
+                    true,
+                    bridgeParams.destinationChain,
+                    bridgeParams.recipient,
+                    seq
+                );
+            } else {
+                // Send all target tokens to user
+                IERC20(state.targetToken).safeTransfer(msg.sender, state.totalTargetAmount);
+                emit DustProcessed(
+                    msg.sender,
+                    address(0), // Multiple dust tokens
+                    0,          // Multiple amounts
+                    state.targetToken,
+                    state.totalTargetAmount,
+                    false,
+                    0,
+                    bytes32(0),
+                    0
+                );
+            }
+        }
 
         emit BatchProcessComplete(msg.sender, state.totalProcessed);
     }
@@ -226,24 +275,26 @@ contract DustCollectorWithOptionalBridge is ReentrancyGuard, Ownable {
                     state.totalETH += dustAmounts[i];
                     _validateETHUsage(bridgeParams, state.totalETH);
                     
-                    state.totalProcessed += _processETHDust(
+                    uint256 swapOutput = _processETHDust(
                         dustAmounts[i],
                         swapPaths[i],
-                        minOutAmounts[i],
-                        bridgeParams
+                        minOutAmounts[i]
                     );
+                    state.totalProcessed += swapOutput;
+                    state.totalTargetAmount += swapOutput;
                 } else {
                     state.lastETHIndex = int256(i);
                 }
             } else {
                 // ERC20 dust
-                state.totalProcessed += _processERC20Dust(
+                uint256 swapOutput = _processERC20Dust(
                     dustTokens[i],
                     dustAmounts[i],
                     swapPaths[i],
-                    minOutAmounts[i],
-                    bridgeParams
+                    minOutAmounts[i]
                 );
+                state.totalProcessed += swapOutput;
+                state.totalTargetAmount += swapOutput;
             }
         }
         
@@ -260,12 +311,13 @@ contract DustCollectorWithOptionalBridge is ReentrancyGuard, Ownable {
 
         if (state.lastETHIndex >= 0 && remainingETH > 0) {
             uint256 idx = uint256(state.lastETHIndex);
-            state.totalProcessed += _processETHDust(
+            uint256 swapOutput = _processETHDust(
                 remainingETH,
                 swapPaths[idx],
-                minOutAmounts[idx],
-                bridgeParams
+                minOutAmounts[idx]
             );
+            state.totalProcessed += swapOutput;
+            state.totalTargetAmount += swapOutput;
         }
 
         return state;
@@ -273,7 +325,8 @@ contract DustCollectorWithOptionalBridge is ReentrancyGuard, Ownable {
 
     function _validateETHUsage(BridgeParams memory bridgeParams, uint256 totalETHUsed) internal view {
         if (bridgeParams.doBridge) {
-            require(totalETHUsed + bridgeParams.arbiterFee <= msg.value, "excessive ETH");
+            uint256 wormholeFee = wormhole.messageFee();
+            require(totalETHUsed + wormholeFee <= msg.value, "excessive ETH");
         } else {
             require(totalETHUsed <= msg.value, "excessive ETH");
         }
@@ -284,10 +337,10 @@ contract DustCollectorWithOptionalBridge is ReentrancyGuard, Ownable {
         uint256 totalETHUsed
     ) internal view returns (uint256) {
         if (bridgeParams.doBridge) {
-            require(bridgeParams.arbiterFee <= msg.value, "insufficient fee");
-            return msg.value - totalETHUsed - bridgeParams.arbiterFee;
+            uint256 wormholeFee = wormhole.messageFee();
+            require(wormholeFee <= msg.value, "insufficient fee");
+            return msg.value - totalETHUsed - wormholeFee;
         } else {
-            require(bridgeParams.arbiterFee == 0, "arbiterFee must be 0 to skip");
             return msg.value - totalETHUsed;
         }
     }
@@ -299,21 +352,21 @@ contract DustCollectorWithOptionalBridge is ReentrancyGuard, Ownable {
         uint256 remainingETH = _calculateRemainingETH(bridgeParams, state.totalETH);
         
         if (bridgeParams.doBridge) {
-            require(state.totalETH + remainingETH + bridgeParams.arbiterFee == msg.value, "ETH+fee mismatch");
+            uint256 wormholeFee = wormhole.messageFee();
+            require(state.totalETH + remainingETH + wormholeFee == msg.value, "ETH+fee mismatch");
         } else {
             require(state.totalETH + remainingETH == msg.value, "ETH mismatch");
         }
     }
 
     /**
-     * @dev Process one ERC20 dust: pull -> swapERC20->Token -> (optional) bridge or send to user
+     * @dev Process one ERC20 dust: pull -> swapERC20->Token (accumulate, don't bridge yet)
      */
     function _processERC20Dust(
         address dust,
         uint256 amtToPull,
         address[] calldata path,
-        uint256 minOut,
-        BridgeParams memory bridgeParams
+        uint256 minOut
     ) internal returns (uint256) {
         // Pull user balance
         if (amtToPull == 0) {
@@ -336,26 +389,16 @@ contract DustCollectorWithOptionalBridge is ReentrancyGuard, Ownable {
         _revokeRouter(dust);
 
         uint256 actualOut = out[out.length - 1];
-        
-        _handleOutput(
-            dust,
-            amtToPull,
-            path[path.length - 1],
-            actualOut,
-            bridgeParams
-        );
-
         return actualOut;
     }
 
     /**
-     * @dev Process one ETH dust: swapETH->Token -> (optional) bridge or send to user
+     * @dev Process one ETH dust: swapETH->Token (accumulate, don't bridge yet)
      */
     function _processETHDust(
         uint256 ethAmt,
         address[] calldata path,
-        uint256 minOut,
-        BridgeParams memory bridgeParams
+        uint256 minOut
     ) internal returns (uint256) {
         uint256[] memory out = router.swapExactETHForTokens{ value: ethAmt }(
             minOut,
@@ -365,15 +408,6 @@ contract DustCollectorWithOptionalBridge is ReentrancyGuard, Ownable {
         );
         
         uint256 actualOut = out[out.length - 1];
-
-        _handleOutput(
-            address(0),
-            ethAmt,
-            path[path.length - 1],
-            actualOut,
-            bridgeParams
-        );
-
         return actualOut;
     }
 
@@ -393,57 +427,21 @@ contract DustCollectorWithOptionalBridge is ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev If bridging needed, call bridge; otherwise send directly to user
+     * @dev Bridge all accumulated target tokens in a single transaction
      */
-    function _handleOutput(
-        address dustToken,
-        uint256 dustAmount,
+    function _bridgeAllTokens(
         address outputToken,
-        uint256 outputAmount,
-        BridgeParams memory bridgeParams
-    ) internal {
-        if (!bridgeParams.doBridge) {
-            IERC20(outputToken).safeTransfer(msg.sender, outputAmount);
-            emit DustProcessed(
-                msg.sender,
-                dustToken,
-                dustAmount,
-                outputToken,
-                outputAmount,
-                false,
-                0,
-                bytes32(0),
-                0
-            );
-        } else {
-            uint64 seq = _bridgeTokens(outputToken, outputAmount, bridgeParams);
-            emit DustProcessed(
-                msg.sender,
-                dustToken,
-                dustAmount,
-                outputToken,
-                outputAmount,
-                true,
-                bridgeParams.destinationChain,
-                bridgeParams.recipient,
-                seq
-            );
-        }
-    }
-
-    function _bridgeTokens(
-        address outputToken,
-        uint256 outputAmount,
+        uint256 totalAmount,
         BridgeParams memory bridgeParams
     ) internal returns (uint64) {
-        IERC20(outputToken).safeIncreaseAllowance(address(tokenBridge), outputAmount);
+        IERC20(outputToken).safeIncreaseAllowance(address(tokenBridge), totalAmount);
         
         // According to official docs: only pay wormhole message fee
         uint256 wormholeFee = wormhole.messageFee();
         
         uint64 seq = tokenBridge.transferTokens{ value: wormholeFee }(
             outputToken,
-            outputAmount,
+            totalAmount,
             bridgeParams.destinationChain,
             bridgeParams.recipient,
             bridgeParams.arbiterFee,  // Optional relayer fee
