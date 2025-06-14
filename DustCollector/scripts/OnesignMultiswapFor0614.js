@@ -10,12 +10,63 @@ import { JsonRpcProvider } from 'ethers';
 const RPC_URL   = process.env.RPC_URL;
 const PRIVKEY   = process.env.PRIVATE_KEY;
 const PERMIT2   = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
-const COLLECTOR = '0x45AAbad78c43C337cB6Cf2fFeCE42aa394d26314';
+const COLLECTOR = '0xCd1632EaA70569E196987dB7F229495e41dc4F05';
 const TARGET    = '0x66a00769800E651E9DbbA384d2B41A45A9660912';
 
+// Wormhole 相关配置
+const WORMHOLE_CORE = process.env.WORMHOLE_CORE || '0x79A1027a6A159502049F10906D333EC57E95F083';
+const DST_CHAIN   = process.env.DST_CHAIN ? parseInt(process.env.DST_CHAIN) : 0;
+const ARBITER_FEE = process.env.ARBITER_FEE ? parseUnits(process.env.ARBITER_FEE, 18) : 0n;
+
+// Solana 地址转换函数
+function base58Decode(str) {
+  const alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  let result = 0n;
+  for (let i = 0; i < str.length; i++) {
+    const index = alphabet.indexOf(str[i]);
+    if (index === -1) throw new Error('Invalid base58 character');
+    result = result * 58n + BigInt(index);
+  }
+  
+  const bytes = [];
+  while (result > 0n) {
+    bytes.unshift(Number(result % 256n));
+    result = result / 256n;
+  }
+  
+  for (let i = 0; i < str.length && str[i] === '1'; i++) {
+    bytes.unshift(0);
+  }
+  
+  return new Uint8Array(bytes);
+}
+
+function toBytes32(addr) {
+  if (!addr || addr.trim() === '') return ZeroHash;
+  
+  addr = addr.trim();
+  
+  if (addr.startsWith('0x')) {
+    return '0x' + addr.slice(2).toLowerCase().padStart(64, '0');
+  } else if (addr.length === 44 && /^[1-9A-HJ-NP-Za-km-z]+$/.test(addr)) {
+    // Solana 地址
+    const decoded = base58Decode(addr);
+    if (decoded.length !== 32) throw new Error(`Invalid Solana address length: ${decoded.length}`);
+    return '0x' + Array.from(decoded).map(b => b.toString(16).padStart(2, '0')).join('');
+  } else {
+    const hex = addr.replace(/^0x/, '');
+    if (!/^[0-9a-fA-F]+$/.test(hex)) throw new Error(`Invalid address format: ${addr}`);
+    return '0x' + hex.toLowerCase().padStart(64, '0');
+  }
+}
+
+const RECIPIENT = process.env.RECIPIENT ? toBytes32(process.env.RECIPIENT) : ZeroHash;
+
+console.log('RECIPIENT:', RECIPIENT);
+
 const TOKENS = [
-  { addr: '0x4aDcEaAec49D145C0764A626a0F610C9eDfFf35B', dec: 18, amt: '0.10', fee: 3000 },
-  { addr: '0x1d2727D1A01D5067760a2Dd13c5936DDebCDeD5b', dec: 18, amt: '0.20', fee: 3000 }
+  { addr: '0x4aDcEaAec49D145C0764A626a0F610C9eDfFf35B', dec: 18, amt: '0.01', fee: 3000 },
+  { addr: '0x1d2727D1A01D5067760a2Dd13c5936DDebCDeD5b', dec: 18, amt: '0.02', fee: 3000 }
 ];
 
 /* ---------- ABI ---------- */
@@ -34,6 +85,10 @@ const PERMIT2_ABI = [
 const ERC20_ABI = [
   'function approve(address spender, uint256 amount) external returns (bool)',
   'function allowance(address owner, address spender) external view returns (uint256)'
+];
+
+const CORE_ABI = [
+  'function messageFee() external view returns (uint256)'
 ];
 
 /* ---------- Helpers ---------- */
@@ -60,7 +115,18 @@ async function ensureApproval(token, wallet, spender, amount) {
   const chainId  = (await provider.getNetwork()).chainId;
 
   console.log(`👛 Wallet:   ${wallet.address}`);
-  console.log(`🌐 ChainId:  ${chainId}\n`);
+  console.log(`🌐 ChainId:  ${chainId}`);
+  console.log(`🎯 DstChain: ${DST_CHAIN}`);
+  console.log(`📨 Recipient: ${RECIPIENT}`);
+  console.log(`💰 ArbiterFee: ${ARBITER_FEE.toString()}\n`);
+
+  // 查询 Wormhole 消息费用
+  let msgFee = 0n;
+  if (DST_CHAIN > 0) {
+    const core = new Contract(WORMHOLE_CORE, CORE_ABI, provider);
+    msgFee = await core.messageFee();
+    console.log(`📦 MessageFee: ${msgFee.toString()} wei`);
+  }
 
   /* step 0: prepare amounts */
   for (const tk of TOKENS) tk.amtWei = parseUnits(tk.amt, tk.dec);
@@ -120,15 +186,18 @@ async function ensureApproval(token, wallet, spender, amount) {
     {
       commands,
       inputs,
-      deadline:  Math.floor(Date.now() / 1e3) + 1800,
+      deadline:    Math.floor(Date.now() / 1e3) + 1800,
       targetToken: TARGET,
-      dstChain:    0,
-      recipient:   ZeroHash,
-      arbiterFee:  0
+      dstChain:    DST_CHAIN,
+      recipient:   RECIPIENT,
+      arbiterFee:  ARBITER_FEE
     },
     TOKENS.map(t => t.addr),
     TOKENS.map(t => t.amtWei),
-    { gasLimit: 1_000_000 }
+    { 
+      gasLimit: 1_000_000,
+      value: msgFee + ARBITER_FEE
+    }
   );
 
   console.log('⛓️  Swap  TxHash:', swapTx.hash);

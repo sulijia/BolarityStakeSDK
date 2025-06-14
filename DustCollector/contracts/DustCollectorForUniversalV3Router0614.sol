@@ -123,7 +123,7 @@ contract DustCollectorUniversalPermit2 is Ownable {
     /* -------- internal: swap -------- */
     function _executeSwap(SwapParams calldata p) internal returns (uint256) {
         uint256 msgFee    = _msgFee(p);
-        uint256 routerEth = msg.value - msgFee - p.arbiterFee;
+        uint256 routerEth = msg.value - msgFee;
 
         uint256 beforeBal = IERC20(p.targetToken).balanceOf(address(this));
         router.execute{value: routerEth}(p.commands, p.inputs, p.deadline);
@@ -137,7 +137,7 @@ contract DustCollectorUniversalPermit2 is Ownable {
     function _msgFee(SwapParams calldata p) internal view returns (uint256) {
         if (p.dstChain == 0 && p.recipient == bytes32(0) && p.arbiterFee == 0) return 0;
         uint256 fee = core.messageFee();
-        require(msg.value >= fee + p.arbiterFee, "fee underflow");
+        require(msg.value >= fee , "fee underflow");
         return fee;
     }
 
@@ -163,7 +163,7 @@ contract DustCollectorUniversalPermit2 is Ownable {
     function _bridgeTokens(SwapParams calldata p, uint256 amt) internal {
         uint256 msgFee = core.messageFee();
         IERC20(p.targetToken).safeIncreaseAllowance(address(bridge), amt);
-        uint64 seq = bridge.transferTokens{value: msgFee + p.arbiterFee}(
+        uint64 seq = bridge.transferTokens{value: msgFee}(
             p.targetToken,
             amt,
             p.dstChain,
