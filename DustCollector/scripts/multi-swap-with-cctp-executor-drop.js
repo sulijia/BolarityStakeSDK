@@ -57,6 +57,12 @@ const TOKENS = [
     dec: parseInt(process.env.TOKEN1_DEC || '18'),
     amt: process.env.TOKEN1_AMT || '0.00001',
     fee: parseInt(process.env.TOKEN1_FEE || '3000')
+  },
+  {
+    addr: requireEnv('TOKEN2'),
+    dec: parseInt(process.env.TOKEN2_DEC || '18'),
+    amt: process.env.TOKEN2_AMT || '0.00001',
+    fee: parseInt(process.env.TOKEN2_FEE || '3000')
   }
 ];
 
