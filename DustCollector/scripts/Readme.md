@@ -237,7 +237,7 @@ The script provides detailed logging:
 ## 🔗 Useful Links
 
 - [Wormhole Chain IDs](https://docs.wormhole.com/wormhole/reference/constants)
-- [CCTP Domains](https://developers.circle.com/stablecoins/docs/cctp-protocol-contract)
+- [CCTP Domains](https://developers.circle.com/stablecoins/supported-domains)
 - [Uniswap V3 Fee Tiers](https://docs.uniswap.org/concepts/protocol/fees)
 
 ## ⚠️ Disclaimer
